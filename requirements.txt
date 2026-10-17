@@ -1,0 +1,5 @@
+# The homr engine's own environment (never the app's). Python 3.12; install into a venv under .bench/:
+#   python -m venv .bench/homr-venv && .bench/homr-venv/Scripts/pip install -r engines/homr/requirements.txt
+#   .bench/homr-venv/Scripts/python engines/homr/setup.py
+# For the GPU (DirectML, RX 9070 XT): onnxruntime-directml==1.24.4 in place of onnxruntime, then server.py --dml.
+homr==0.7.0
