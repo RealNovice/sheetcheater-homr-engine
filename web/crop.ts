@@ -119,7 +119,7 @@ function sample(g: Gray, x: number, y: number): number {
  * shift within reach of the last one that puts most ink under five lines, tracked out from the middle and
  * smoothed. Returns a shift per column of the page (0 outside the staff).
  */
-export function lineOffsets(page: Gray, staff: StaffGeometry): Float32Array {
+export function lineOffsets(page: Gray, staff: StaffGeometry, around?: ArrayLike<number>): Float32Array {
   const w = page.width;
   const out = new Float32Array(w);
   const s = staff.spacing;
@@ -155,10 +155,12 @@ export function lineOffsets(page: Gray, staff: StaffGeometry): Float32Array {
     }
     return top;
   };
+  // With a bend known (task 0018: the engine's own staves), the lines are followed about it.
+  const base = (x: number): number => (around ? around[Math.max(0, Math.min(around.length - 1, x))]! : 0);
   const mid = Math.trunc(xs.length / 2);
-  dys[mid] = best(xs[mid]!, 0, 0.6 * s);
-  for (let k = mid + 1; k < xs.length; k++) dys[k] = best(xs[k]!, dys[k - 1]!, 0.2 * s);
-  for (let k = mid - 1; k >= 0; k--) dys[k] = best(xs[k]!, dys[k + 1]!, 0.2 * s);
+  dys[mid] = best(xs[mid]!, base(xs[mid]!), 0.6 * s);
+  for (let k = mid + 1; k < xs.length; k++) dys[k] = best(xs[k]!, dys[k - 1]! + base(xs[k]!) - base(xs[k - 1]!), 0.2 * s);
+  for (let k = mid - 1; k >= 0; k--) dys[k] = best(xs[k]!, dys[k + 1]! + base(xs[k]!) - base(xs[k + 1]!), 0.2 * s);
   // A median of five steps, then straight lines between the steps.
   const smooth = Array.from(dys, (_, k) => [...dys.slice(Math.max(0, k - 2), k + 3)].sort((a, b) => a - b)[Math.trunc(Math.min(5, Math.min(k + 3, xs.length) - Math.max(0, k - 2)) / 2)]!);
   for (let x = 0; x < w; x++) {
@@ -280,18 +282,67 @@ export function joined(page: Gray, upper: { bottom: number; x0: number; spacing:
   const s = upper.spacing;
   const y0 = Math.round(upper.bottom);
   const y1 = Math.round(lower.top);
+  // The next page of an open book starts at the top again: not the same system.
+  if (y1 < y0 - 2) return false;
   if (y1 - y0 < 2) return true;
-  for (let x = Math.max(0, Math.round(x0 - 2.5 * s)); x <= Math.min(page.width - 1, Math.round(x0 + 1.5 * s)); x++) {
-    let dark = 0;
-    for (let y = y0; y <= y1; y++) {
-      let d = false;
-      for (let dx = -1; dx <= 1 && !d; dx++) {
-        const xx = x + dx;
-        if (xx >= 0 && xx < page.width && y >= 0 && y < page.height && page.data[y * page.width + xx]! < threshold) d = true;
-      }
-      if (d) dark++;
+  const span = y1 - y0 + 1;
+  // On a photo the page's verticals lean even where its staff lines were straightened (a keystone; task 0018): the
+  // line is looked for at every lean up to 1 in 6, one pixel of drift at a time.
+  const lean = Math.ceil(span / 6);
+  const darkAt = (x: number, y: number): boolean => {
+    for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx;
+      if (xx >= 0 && xx < page.width && y >= 0 && y < page.height && page.data[y * page.width + xx]! < threshold) return true;
     }
-    if (dark >= 0.92 * (y1 - y0 + 1)) return true;
+    return false;
+  };
+  const share = (x: number, drift: number): number => {
+    let dark = 0;
+    for (let y = y0; y <= y1; y++) if (darkAt(Math.round(x + (drift * (y - y0)) / span), y)) dark++;
+    return dark / span;
+  };
+  const from = Math.max(0, Math.round(x0 - 2.5 * s));
+  const to = Math.min(page.width - 1, Math.round(x0 + 1.5 * s));
+  const near = Math.max(3, Math.round(0.4 * s));
+  const reach = near + Math.max(2, Math.round(0.3 * s));
+  // A thin line, not the edge of something dark (a photo's background, a shadow): paper close on both sides of it.
+  const paper = (x: number, drift: number, a: number, b: number): boolean => {
+    for (let k = a; k <= b; k++) if (share(x + k, drift) < 0.5) return true;
+    return false;
+  };
+  for (let drift = -lean; drift <= lean; drift++) {
+    for (let x = from; x <= to; x++) {
+      if (share(x, drift) >= 0.92 && paper(x, drift, -reach, -near) && paper(x, drift, near, reach)) return true;
+    }
   }
   return false;
+}
+
+/**
+ * Ink against the paper around it (task 0018): 0 where a pixel is clearly darker than the mean of the box about it
+ * (half-width 1.5 spacings), else 255. Ink in a shadow stays ink; a shadow or a dark background alone is paper.
+ */
+export function inkMap(page: Gray, spacing: number): Gray {
+  const { width: w, height: h, data } = page;
+  const r = Math.max(4, Math.round(1.5 * spacing));
+  const sum = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    for (let x = 0; x < w; x++) {
+      row += data[y * w + x]!;
+      sum[(y + 1) * (w + 1) + x + 1] = sum[y * (w + 1) + x + 1]! + row;
+    }
+  }
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const ya = Math.max(0, y - r);
+    const yb = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const xa = Math.max(0, x - r);
+      const xb = Math.min(w, x + r + 1);
+      const mean = (sum[yb * (w + 1) + xb]! - sum[ya * (w + 1) + xb]! - sum[yb * (w + 1) + xa]! + sum[ya * (w + 1) + xa]!) / ((yb - ya) * (xb - xa));
+      out[y * w + x] = data[y * w + x]! < mean - Math.max(12, 0.15 * mean) ? 0 : 255;
+    }
+  }
+  return { width: w, height: h, data: out };
 }

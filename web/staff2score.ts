@@ -6,6 +6,7 @@
  * time with a key/value cache, greedily, each symbol in six branches (rhythm, pitch, lift, position,
  * articulation, slur) until the end token.
  */
+import { CACHES, GrowingCache, hasLastRows } from './lastRows';
 import vocabulary from './vocabulary.json';
 
 /** The part of onnxruntime-web's API used here (the browser's `ort` global, or the npm package in Node). */
@@ -17,7 +18,10 @@ export interface OrtTensor {
   readonly dims: readonly number[];
 }
 export interface OrtSessionLike {
-  run(feeds: Record<string, OrtTensor>): Promise<Record<string, OrtTensor>>;
+  /** `fetches`: only these outputs are copied out of the runtime. */
+  run(feeds: Record<string, OrtTensor>, fetches?: readonly string[]): Promise<Record<string, OrtTensor>>;
+  /** Frees the session (onnxruntime-web's `release`). */
+  release?(): Promise<void>;
 }
 
 /** One symbol as homr's EncodedSymbol: the six branches, as their token text. */
@@ -75,16 +79,30 @@ const BRANCHES = [
 
 const round = (p: number): number => Math.round(p * 1e4) / 1e4;
 
-/** Reads one staff image: the symbols homr's transformer writes for it. */
-export async function readStaff(ort: OrtLike, encoder: OrtSessionLike, decoder: OrtSessionLike, input: Float32Array, maxSteps: number = VOCAB.config.maxSeqLen): Promise<HomrSymbol[]> {
+/** The encoder's reading of one staff image: the context the decoder writes the staff's symbols from. */
+export async function encodeStaff(ort: OrtLike, encoder: OrtSessionLike, input: Float32Array): Promise<OrtTensor> {
+  const enc = await encoder.run({ input: new ort.Tensor('float32', input, [1, 1, VOCAB.config.height, VOCAB.config.width]) });
+  return enc.output!;
+}
+
+/**
+ * Reads one staff image: the symbols homr's transformer writes for it. `encoded`: the encoder's answer when it was
+ * asked before (`encodeStaff`), so the encoder can be gone while the decoder runs (task 0023).
+ */
+export async function readStaff(ort: OrtLike, encoder: OrtSessionLike | null, decoder: OrtSessionLike, input: Float32Array | null, maxSteps: number = VOCAB.config.maxSeqLen, encoded?: OrtTensor): Promise<HomrSymbol[]> {
   const { heads, dim, depth, eos } = VOCAB.config;
   const headDim = dim / heads;
-  const enc = await encoder.run({ input: new ort.Tensor('float32', input, [1, 1, VOCAB.config.height, VOCAB.config.width]) });
-  const context = enc.output!;
+  const context = encoded ?? (await encodeStaff(ort, encoder!, input!));
   const contextData = context.data as Float32Array;
   // After the first step only the context's first row goes in (homr: x_transformers' split of the context).
   const reduced = new ort.Tensor('float32', contextData.slice(0, dim), [1, 1, dim]);
   let cache: OrtTensor[] = Array.from({ length: depth * 4 }, () => new ort.Tensor('float32', new Float32Array(0), [1, heads, 0, headDim]));
+  // A decoder with the caches' last rows as outputs (lastRows.ts): after the first step only those come out, and the
+  // caches grow here. Without them every cache comes out whole on every step, as before.
+  // Known from the first step's outputs.
+  let rows = false;
+  const fetches = [...BRANCHES.map(([name]) => name), ...Array.from({ length: CACHES }, (_, i) => `cache_new${i}`)];
+  let grown: GrowingCache[] = [];
   const id = (n: number): OrtTensor => new ort.Tensor('int64', BigInt64Array.from([BigInt(n)]), [1, 1]);
   let last = { rhythm: 1, pitch: 0, lift: 0, articulation: 0, slur: 0 };
   const out: HomrSymbol[] = [];
@@ -99,8 +117,14 @@ export async function readStaff(ort: OrtLike, encoder: OrtSessionLike, decoder: 
       cache_len: new ort.Tensor('int64', BigInt64Array.from([BigInt(step)]), [1]),
     };
     cache.forEach((c, i) => (feeds[`cache_in${i}`] = c));
-    const r = await decoder.run(feeds);
-    cache = cache.map((_, i) => r[`cache_out${i}`]!);
+    const r: Record<string, OrtTensor> = rows ? await decoder.run(feeds, fetches) : await decoder.run(feeds);
+    if (step === 0) rows = depth * 4 === CACHES && hasLastRows(Object.keys(r));
+    if (!rows) cache = cache.map((_, i) => r[`cache_out${i}`]!);
+    else {
+      if (step === 0) grown = cache.map((_, i) => r[`cache_out${i}`]!).map((t) => new GrowingCache(heads, headDim, t.data as Float32Array, t.dims[2]!));
+      else grown.forEach((g, i) => g.append(r[`cache_new${i}`]!.data as Float32Array));
+      cache = grown.map((g) => new ort.Tensor('float32', g.view(), [1, heads, g.length, headDim]));
+    }
     const pick = Object.fromEntries(BRANCHES.map(([name, branch]) => [branch, argmax(r[name]!.data as ArrayLike<number>)])) as Record<(typeof BRANCHES)[number][1], number>;
     if (pick.rhythm === eos) break;
     const rhythm = topTwo(r.out_rhythms!.data as ArrayLike<number>);
